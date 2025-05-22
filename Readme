@@ -1,0 +1,429 @@
+Di seguito trovi il testo discorsivo unico e completo — pensato per essere incollato così com'è in Lovable, in un documento di specifica o in una issue GitHub — che descrive dall'inizio alla fine come dev'essere progettato, realizzato, testato e distribuito il backend "enterprise-grade" che trasforma prompt in automazioni n8n, con Supabase come piattaforma centrale.
+
+⸻
+
+1. Visione generale
+
+Voglio un backend robusto, scalabile e sicuro che permetta a qualunque utente di digitare un prompt in linguaggio naturale (es. «Ogni lunedì mandami via WhatsApp il report dei lead su Airtable») e ottenere un workflow n8n attivo, testato e monitorato.
+L'intero stack deve ruotare intorno a Supabase (database, autenticazione, Edge Functions) e a un'istanza n8n self-hosted su Google Cloud Platform (GCP). L'interpretazione del linguaggio naturale è affidata a GPT-4o. Il servizio sarà venduto a canone mensile premium, quindi pretendo livelli di qualità, sicurezza e auditing tipici di un SaaS B2B mission-critical.
+
+⸻
+
+2. Flusso logico end-to-end
+	1.	Accesso e Input Iniziale:
+		•	L'utente naviga alla homepage e clicca "Crea la tua automazione".
+		•	Se l'utente non è loggato, viene reindirizzato alla pagina di login/signup.
+		•	Una volta autenticato, l'utente inserisce il prompt iniziale nella pagina dedicata.
+	2.	Persistenza Prompt Iniziale – il prompt viene salvato in Supabase (tabella `prompts`).
+	3.	Generazione Domande AI – una Edge Function (`generate_clarification_questions`) chiama GPT-4o per analizzare il prompt e generare una serie di domande mirate a chiarire eventuali ambiguità o a raccogliere dettagli mancanti. Le domande vengono salvate in `prompt_clarifications`.
+	4.	Interazione Utente per Chiarimenti – Il frontend mostra le domande all'utente (generate al round corrente). L'utente può rispondere solo "sì" o "no" per ciascuna. Le risposte vengono salvate in `prompt_clarifications` (con il `round` appropriato e `answer_type` corrispondente).
+	5.	Parsing AI Avanzato e Iterazione – La Edge Function `create_workflow_from_prompt` riceve il `prompt_id` e considera tutte le risposte fornite nei vari `round` di `prompt_clarifications`.
+    
+    5.1. Mappatura Intento a Capacità AI: La funzione `create_workflow_from_prompt` carica `supabase/ai_capabilities.json`. Utilizza l'output della comprensione iniziale del prompt da parte di GPT-4o (incluse entità come servizi coinvolti e azione principale) e le `keywords_trigger` dal file JSON per tentare di mappare l'intento dell'utente a uno o più `enabled_automation_patterns` con status `active`.
+        *   Se un match `active` viene trovato: Si procede con il punto 5.2, fornendo a GPT-4o il contesto del pattern matchato come guida aggiuntiva.
+        *   Se nessun match `active` viene trovato: Si segue la logica definita in `global_settings.default_behavior_if_unmatched` (es. `inform_user_and_log`: l'utente viene informato che la sua richiesta specifica non è (ancora) supportata, e la richiesta viene loggata. Non si procede alla generazione del workflow JSON). Il sistema potrebbe considerare pattern con status `beta` o `experimental` se `allow_experimental_if_not_matched` è `true`, comunicandolo all'utente.
+        *   In caso di più match `active`, si potrebbe dare priorità o chiedere ulteriore specifica all'utente (per ora, si assume un match unico o nessun match `active`).
+
+    5.2. Generazione Condizionata del Workflow JSON: Solo se la mappatura al punto 5.1 ha avuto successo con un pattern `active` (o altra logica permessa), si procede:
+    Chiama GPT-4o per:
+    a) Valutare se il prompt originale, arricchito da tutte le risposte "sì/no" raccolte e guidato dal pattern identificato, è ora sufficientemente chiaro e completo per generare un workflow.
+    b) Se la valutazione è positiva, GPT-4o genera il JSON strutturato del workflow, conformemente al pattern. Si procede al Punto 6 (Validazione).
+    c) Se la valutazione è negativa (cioè, permangono ambiguità o mancano dettagli critici nonostante le risposte e il pattern), e non è stato superato un numero massimo di cicli di chiarimento (es. 3 `round`), GPT-4o viene istruito a generare un *nuovo* set di domande più specifiche, tenendo conto di tutto il contesto precedente (incluso il pattern). Queste nuove domande vengono generate invocando la funzione `generate_clarification_questions` e salvate in `prompt_clarifications` (con `round` incrementato). Il frontend le mostrerà all'utente (ritorno al Punto 4).
+    d) Se il numero massimo di cicli viene raggiunto e l'AI ritiene ancora di non avere informazioni sufficienti, o se la mappatura iniziale al pattern fallisce come da 5.1, il processo si interrompe per quel prompt, e l'utente viene notificato che il suo intento non può essere tradotto automaticamente e potrebbe aver bisogno di riformulare la richiesta o contattare il supporto.
+	6.	Validazione – il JSON generato da GPT-4o è validato (Zod/Pydantic) contro la **versione più recente** di uno schema proprietario versionato. Il `definition_json` salvato includerà una proprietà interna `schema_version` (es. `"schema_version": "1.1.0"`) per indicare con quale versione dello schema è stato creato. Se non è conforme, si blocca e si notifica l'utente.
+	7.	Creazione workflow (da Prompt) – un'altra Edge Function (`generate_n8n_workflow`) costruisce i nodi e le connessioni via API REST di n8n, salvando l' `n8n_id` e lo stato (inizialmente `inactive` o `draft`) nella tabella `workflows`. Il JSON validato e versionato (con `schema_version` interna) viene salvato in `workflows.definition_json`.
+    *Nota sulla gestione delle versioni dello schema*: Quando un workflow esistente con un `definition_json` basato su una `schema_version` precedente viene processato (es. clonato, testato, attivato, modificato), le funzioni responsabili devono prima leggere la `schema_version` interna al JSON. Se non è la più recente, applicano una o più trasformazioni di migrazione sequenziali per portare il JSON alla struttura dello schema più recente prima di procedere con l'elaborazione.
+	8.	Utilizzo dei Template:
+		•	Accesso: Il frontend presenta una pagina dedicata "Template" dove gli utenti possono sfogliare workflow predefiniti (filtrando `workflows` per `is_template = true`). I template sono visualizzati con `template_name`, `template_description` e raggruppati per `template_category`.
+		•	Clonazione: L'utente seleziona un template e clicca "Usa questo template" o "Clona". Questo invoca una Edge Function (`clone_workflow_from_template`).
+		•	Creazione Workflow (da Template): La funzione `clone_workflow_from_template` crea una nuova riga nella tabella `workflows` per l'utente corrente, copiando `definition_json`, `template_name` (come nome iniziale del workflow), e altri metadati rilevanti dal template originale. Imposta `is_template = false` e `source_template_id` all'ID del template originale. Il nuovo workflow è inizialmente `inactive`.
+		•	Personalizzazione Credenziali: Il frontend guida l'utente a configurare le credenziali necessarie per i servizi utilizzati nel workflow clonato (es. Shopify, Airtable). L'utente inserirà le proprie API keys/tokens attraverso il flusso sicuro `manage_user_service_credential` (che salva i segreti in Vault).
+		•	Visibilità: Il workflow clonato e (potenzialmente) in attesa di configurazione credenziali appare immediatamente nella sezione "I miei workflow" dell'utente (account).
+
+    *Identificazione e Configurazione Credenziali (per workflow da prompt e da template):*
+    Indipendentemente dall'origine del workflow (`definition_json`):
+    1.  L'AI (GPT-4o), durante l'analisi del prompt o del `definition_json` (tramite `get_required_credentials_for_workflow`), identifica i servizi esterni che richiedono credenziali.
+    2.  Il sistema verifica tramite `user_service_credentials` quali credenziali sono già state fornite dall'utente.
+    3.  Il frontend presenta all'utente una richiesta mirata per le sole credenziali mancanti o da aggiornare, prima di procedere alla generazione del workflow in n8n (`generate_n8n_workflow`).
+
+	9.	Suggerimenti di Automazione (Fase 1: Template Popolari):
+		•	Logica: Il sistema traccia quante volte ogni template (`is_template = true`) viene clonato (campo `clone_count` in `workflows`).
+		•	Presentazione: Nel frontend (es. dashboard, pagina di creazione prompt, pagina template) viene mostrata una sezione "Template Popolari" o "Suggerimenti", che elenca i template con il `clone_count` più alto.
+		•	Interazione: Cliccando su un suggerimento, l'utente avvia il flusso di clonazione del template selezionato.
+	10.	Dry-run automatico – il nuovo flusso (sia da prompt che da template, una volta configurato e prima dell'attivazione finale) è clonato in un workspace "testing" di n8n. L'AI (GPT-4o), analizzando il `definition_json` del workflow, genera:
+    a) Un payload di input fittizio ma semanticamente appropriato per il trigger del workflow (es. dati di un ordine Shopify finto se il trigger è "Nuovo ordine Shopify").
+    b) Configurazioni di mock (stub) per Wiremock, per simulare le risposte attese dai servizi esterni referenziati nei nodi del workflow (es. simulare una creazione record in Airtable, un invio messaggio WhatsApp).
+    Il workflow viene quindi eseguito in questo ambiente controllato, utilizzando i dati di input generati e interagendo con i servizi mockati da Wiremock. In via eccezionale, e solo per specifici servizi esterni pre-approvati per i quali il mocking è eccessivamente complesso o insufficiente, si potrebbero utilizzare credenziali di test reali (memorizzate in un path dedicato e sicuro in Vault, es. `kv/global_test_credentials/{service_name}`) che puntano ad ambienti sandbox/test di tali servizi. Se ogni nodo del workflow restituisce `success` (basandosi sulle risposte mockate o, eccezionalmente, reali-sandbox), si passa allo step successivo; altrimenti si logga l'errore in `workflow_errors` e si notifica l'utente (o l'amministratore, a seconda della gravità).
+	11.	Attivazione – il workflow è promosso in produzione (`active = true`) e l'utente riceve conferma.
+	12.	Monitoring continuo – ogni esecuzione reale è loggata in `workflow_runs`; watchdog, circuit-breaker e auto-rollback proteggono da credenziali scadute o API down.
+	13.	Audit & billing – log strutturati (JSON) finiscono in Loki; metriche in Prometheus/Grafana; conteggio workflow attivi e esecuzioni mensili per ogni cliente (account `user_id`).
+
+⸻
+
+3. Modello dati in Supabase
+	•	users – viene dall'Auth di Supabase (RBAC Owner / Admin / Viewer). Ogni record `user` rappresenta un account cliente. Se più persone di un team accedono utilizzando le stesse credenziali di login, operano sotto lo stesso `user_id` Supabase, condividendo implicitamente tutti i dati associati (prompts, workflows, ecc.).
+	•	prompts – `id`, `user_id`, `prompt_text`, `created_at`.
+	•	prompt_clarifications – `id`, `prompt_id` (FK to prompts), `question_text`, `user_answer` (text, conterrà 'yes' o 'no'), `answer_type` (enum: 'yes', 'no'), `round` (integer, default 1), `created_at`.
+	•	workflows – `id`, `user_id`, `prompt_id` (FK to prompts, nullable se da template o clonato), `definition_json` (JSON del workflow n8n, che include una proprietà interna `schema_version` per tracciare la versione dello schema di validazione con cui è stato generato), `n8n_id` (ID del workflow in n8n), `active` (boolean), `version` (integer), `is_template` (boolean, default false), `template_name` (text, nullable, per i template), `template_description` (text, nullable, per i template), `template_category` (text, nullable, per organizzare i template), `source_template_id` (FK to workflows, nullable, per tracciare l'origine se clonato), `clone_count` (integer, default 0, solo per template), `created_at`, `updated_at`.
+	•	user_service_credentials – `id`, `user_id` (FK to users), `service_name` (es. 'shopify', 'airtable'), `vault_path_hint` (text, non sensibile, es. 'shopify_prod'), `last_updated_at`, `configured_at`. (NOTA: Non contiene MAI il segreto).
+	•	workflow_versions – storico diff per rollback.
+	•	workflow_runs – ogni esecuzione: durata, esito, payload ridotto.
+	•	workflow_errors – errori in fase di build o run: nodo, stack-trace, timestamp.
+	•	subscription_plans – id, name, description, limits_json, price, active.
+	•	user_subscriptions – user_id, plan_id, start_date, end_date, status, payment_id.
+	•	usage_metrics – `user_id`, `month_year`, `active_workflows`, `workflow_executions`.
+
+Tutte le tabelle usano soft-delete (`deleted_at`) e foreign-key con cascading; indici sulle colonne di ricerca più usate.
+
+⸻
+
+3.1 Piani di Abbonamento
+
+Il sistema supporta tre livelli di abbonamento:
+
+1. Piano Base
+   • Numero limitato di workflow attivi
+   • Limite di esecuzioni mensili
+   • Monitoraggio base
+   • Supporto via email
+
+2. Piano Business
+   • Maggiore numero di workflow attivi
+   • Limite superiore di esecuzioni mensili
+   • Monitoraggio completo
+   • Supporto prioritario
+
+3. Piano Enterprise
+   • Workflow attivi illimitati
+   • Esecuzioni mensili elevate o illimitate
+   • Monitoraggio e alerting avanzati (PagerDuty)
+   • Supporto dedicato
+   • SLA garantiti
+   • Data retention estesa
+
+I limiti specifici per ogni piano saranno definiti nella dashboard di amministrazione.
+
+⸻
+
+4. Edge Functions (o RPC) richieste
+
+Funzione	Scopo operativo
+`manage_user_service_credential`	Riceve dal frontend nome del servizio e credenziale utente. Si autentica a Vault e salva la credenziale in un path sicuro (es. `kv/user_credentials/{user_id}/{service_name}`). Aggiorna `user_service_credentials` con metadati.
+`generate_clarification_questions`	Prende `prompt_id` e, opzionalmente, il contesto delle domande e risposte dei `round` precedenti. Invoca GPT-4o con un system prompt che lo istruisce a: 1. Comprendere l'intento dell'utente basandosi sul prompt originale e sul contesto dei chiarimenti precedenti. 2. Suddividere/Raffinare la richiesta in sotto-task logici. 3. Per ogni sotto-task, identificare ambiguità residue, dettagli mancanti e servizi esterni necessari. 4. Formulare un nuovo set di domande di chiarimento concise, evitando ripetizioni se fornito un contesto. La funzione verifica anche dalla tabella `user_service_credentials` se le API/credenziali per i servizi menzionati (e non ancora chieste/verificate) sono configurate. Se mancano, aggiunge domande specifiche. Salva tutte le nuove domande in `prompt_clarifications` con il numero di `round` corretto (incrementato se è un ciclo successivo) e le restituisce al frontend.
+`create_workflow_from_prompt`	Prende `prompt_id`. Raccoglie tutte le risposte dai vari `round` di `prompt_clarifications`. Prima di tentare la generazione del `definition_json`, la funzione carica il file `supabase/ai_capabilities.json` e tenta di mappare l'intento dell'utente a un pattern di automazione definito e attivo. Se nessun pattern attivo corrisponde, o se la mappatura fallisce, la generazione viene interrotta e l'utente viene informato. Se un pattern attivo viene identificato, GPT-4o viene istruito a generare il `definition_json` conformemente a tale pattern e alla **versione più recente dello schema di validazione**. Se durante questo processo emergono ulteriori ambiguità e non è stato superato il limite di `round` di chiarimento, invoca `generate_clarification_questions`. Se il limite è superato o GPT-4o non riesce a procedere, logga l'errore e notifica. Se tutto procede, il `definition_json` (contenente la `schema_version` corrente) viene validato (Zod/Pydantic) e salvato in `workflows`.
+`clone_workflow_from_template`	Prende `template_id` (ID del template sorgente) e `user_id` (ID dell'utente che clona).
+Crea una nuova riga nella tabella `workflows` con i seguenti valori:
+    •	`user_id`: l'`user_id` fornito.
+    •	`prompt_id`: `NULL`.
+    •	`definition_json`: Copiato dal `definition_json` del template sorgente (mantiene la `schema_version` originale del template; la migrazione avverrà al primo utilizzo/modifica).
+    •	`n8n_id`: `NULL`.
+    •	`active`: `false`.
+    •	`version`: `1`.
+    •	`is_template`: `false`.
+    •	`template_name`: Copiato dal `template_name` del template sorgente. Questo servirà come nome iniziale del workflow per l'utente, che potrà modificarlo successivamente.
+    •	`template_description`: Inizialmente `NULL`. L'utente potrà aggiungere una descrizione personalizzata.
+    •	`template_category`: Inizialmente `NULL`. L'utente potrà assegnare una categoria personale al suo workflow.
+    •	`source_template_id`: l'`id` del `template_id` sorgente.
+    •	`clone_count`: Lasciato al valore di default della colonna (es. 0 o NULL, non applicabile per i non-template).
+    •	`created_at`, `updated_at`: Timestamp corrente.
+La funzione incrementa poi il `clone_count` del template sorgente (identificato da `template_id`).
+Non crea ancora il workflow in n8n. Dopo la clonazione, il frontend dovrebbe invocare `get_required_credentials_for_workflow` per determinare quali credenziali sono necessarie. Successivamente, guiderà l'utente nella revisione del nome, nella configurazione delle credenziali identificate e in eventuali personalizzazioni del workflow (potenzialmente assistite dall'AI) prima di invocare `generate_n8n_workflow`.
+`generate_n8n_workflow`	Presuppone che tutte le credenziali necessarie per i servizi nel `definition_json` siano state configurate dall'utente e siano disponibili tramite `user_service_credentials` e Vault. Prende un `workflow_id`. Recupera il `definition_json` dalla tabella `workflows`. Legge la `schema_version` interna al JSON. Se non è la più recente, applica funzioni di migrazione per aggiornare il JSON alla struttura dello schema corrente. Se la migrazione fallisce, logga errore e notifica. Una volta ottenuto un `definition_json` conforme allo schema più recente, lo converte in nodi n8n. Per ogni nodo che richiede credenziali, recupera il segreto da Vault e lo usa per configurare il credential item in n8n via API. Chiama POST `/rest/workflows` di n8n per creare o aggiornare il workflow, salva `n8n_id` in `workflows`.
+`test_workflow`	Prende `workflow_id`. Recupera il `definition_json`. Come per `generate_n8n_workflow`, verifica ed eventualmente migra il `definition_json` alla `schema_version` più recente. Invoca GPT-4o (o una logica dedicata) per:
+    1. Generare un payload di input fittizio e semanticamente appropriato per il trigger del workflow, basandosi sul `definition_json`.
+    2. Generare le configurazioni degli stub Wiremock per i servizi esterni identificati nel `definition_json`, simulando risposte attese.
+    Configura l'ambiente di test n8n (un workspace dedicato) con gli stub Wiremock generati. Esegue il workflow utilizzando l'input fittizio. Per specifici servizi pre-approvati, e se configurato, può essere istruita a usare credenziali di test reali da un path sicuro in Vault (es. `kv/global_test_credentials/{service_name}` che puntano ad ambienti sandbox) invece di Wiremock per quei servizi. Valuta l'esito di ogni nodo; logga l'intera esecuzione (input, output per nodo, esito) in `workflow_runs` (con un flag `is_dry_run=true`).
+`finalize_workflow_status`	se test ok → active = true, altrimenti disattiva e notifica.
+`log_workflow_error`	inserisce record in workflow_errors, invia alert Slack/e-mail.
+`migrate_workflow_definition_to_latest` (Opzionale RPC)	Prende `workflow_id`. Recupera `definition_json`. Se la sua `schema_version` interna non è la più recente, applica le migrazioni necessarie e salva il `definition_json` aggiornato (con la nuova `schema_version`) nella tabella `workflows`. Utile per manutenzione e riduzione del debito tecnico.
+`get_required_credentials_for_workflow`	Prende `workflow_id`. Analizza il `definition_json` associato (potenzialmente con aiuto di GPT-4o) per identificare tutti i servizi esterni che richiedono credenziali. Verifica lo stato di tali credenziali per l'utente corrente in `user_service_credentials`. Restituisce un elenco di credenziali mancanti, configurate o da riconfigurare, per guidare il frontend nella raccolta input utente.
+
+Ogni funzione deve: validare input con Zod, gestire errori con try/catch, firmare le query Postgres con service role JWT, scrivere log pino.
+
+⸻
+
+5. Controlli di qualità automatici
+	•	Validazione schema: nessun campo extra, trigger obbligatori, almeno un'azione.
+	•	Anti-loop: DFS sul grafo, vietati loop senza nodo "Loop Control".
+	•	Variabili orfane: regex su {{variables}} confrontata con output precedente.
+	•	Quota stimate: pre-calcolo di chiamate API / ora; se supera il piano, si blocca.
+	•	Etichetta "heavy": se dry-run > 2 s p95 o RAM > 256 MB.
+	•	Auto-rollback: tre errori consecutivi entro 30 min dal deploy riattivano la versione precedente.
+
+⸻
+
+6. Sicurezza e compliance
+	•	JWT a vita breve (15 min), refresh-token rotati.
+	•	mTLS fra micro-servizi; segreti solo in HashiCorp Vault.
+	•	Gestione Credenziali Utente (Terze Parti):
+		•	Raccolta sicura tramite frontend (HTTPS) e invio a Edge Function dedicata.
+		•	Le Edge Functions si autenticano a Vault (es. via AppRole o Supabase JWT Auth method per Vault) per leggere/scrivere segreti.
+		•	I segreti sono memorizzati in Vault in path specifici per utente e servizio (es. `secret/data/user_credentials/{user_id}/{service_name}`).
+		•	Il database Supabase (tabella `user_service_credentials`) contiene solo metadati non sensibili (es. quale servizio è configurato, quando, un hint al path di Vault, ma MAI il segreto).
+		•	Le Edge Functions recuperano le credenziali da Vault just-in-time quando devono configurare i nodi n8n (idealmente creando/aggiornando "Credential Items" nell'API di n8n).
+		•	n8n utilizza i suoi meccanismi interni per la gestione sicura delle credenziali una volta che gli sono state fornite.
+	•	Modello di Accesso e Condivisione: L'accesso alle funzionalità e ai dati (prompts, workflows) è controllato a livello di account Supabase (`user_id`). Non è previsto un sistema di condivisione granulare o permessi specifici per singolo workflow tra utenti diversi dello stesso account o tra account differenti. Tutti gli utenti che accedono con le medesime credenziali operano sullo stesso set di dati. Future evoluzioni potrebbero introdurre concetti di "Team" o "Organizzazioni" con RBAC più dettagliato.
+	•	Data residency UE: Il progetto Supabase (inclusi database Postgres e storage) è configurato per utilizzare la regione `eu-central-1` (Francoforte, Germania). Tutti i bucket S3 utilizzati direttamente (es. per WAL shipping, export workflow) devono essere creati nella medesima regione UE o in un'altra regione UE compatibile (es. `eu-west-1`, Irlanda) per garantire che tutti i dati degli utenti e i backup risiedano fisicamente all'interno dell'Unione Europea. OpenAI è utilizzato con accordo di elaborazione dati (DPA) e opzione "data processing off" per rispettare i requisiti UE.
+	•	Vulnerability scan su ogni build (Dependabot/Snyk) + pen-test semestrale.
+	•	Audit trail completo consultabile (chi ha fatto cosa e quando).
+	•	Protezione dell'istanza n8n su GCP: Accesso limitato tramite Identity-Aware Proxy (IAP) o firewall GCP, API key n8n con permessi minimi, traffico TLS end-to-end.
+
+⸻
+
+7. CI/CD & Dev-Experience
+
+Repository TypeScript con:
+
+.
+├── docker-compose.yml          # Configurazione per sviluppo locale (supabase, n8n dev, vault, wiremock, grafana)
+├── supabase/                   # migrazioni + seed
+├── supabase/ai_capabilities.json # File di configurazione per le capacità dell'AI
+├── functions/                  # edge functions ts
+├── tests/                      # vitest unit e integrazione
+├── scripts/migrate.sh          # push migrazioni
+├── scripts/dr_bootstrap.sh     # disaster-recovery
+└── .github/workflows/ci.yml    # lint, test, build, push, canary
+
+	•	Lint ESLint + Prettier, test Vitest (coverage ≥ 90 %).
+	•	Mutation testing Stryker per parser e validator.
+	•	Docker Compose locale: `docker compose up -d` avvia l'ambiente di sviluppo locale completo (Supabase, n8n, Vault, Grafana, Wiremock) in circa 2 minuti. Per produzione, n8n è deployato separatamente su GCP.
+	•	GitHub Actions builda immagine, firma con cosign, pubblica su GHCR, Argo CD fa canary 10 %; se error-rate < 1 % in 30 min passa al 100 %.
+	•	Connettività Supabase Edge Functions <-> n8n (GCP): Per produzione, assicurare comunicazione sicura tramite VPC Peering, Identity-Aware Proxy (IAP) per l'endpoint n8n, o un API Gateway. Le Edge Functions utilizzeranno un indirizzo IP statico (se possibile tramite Supabase) per whitelistare le richieste su GCP.
+
+⸻
+
+7.1 Integrazione con Frontend Node.js
+
+Il backend Supabase è progettato per integrarsi con il frontend Node.js esistente attraverso:
+
+	•	Autenticazione: Supabase Auth JWT con @supabase/auth-helpers-nextjs o librerie equivalenti.
+	•	API RESTful: Endpoints esposti per tutte le operazioni CRUD su prompts e workflows.
+	•	Realtime: Supabase Realtime per aggiornamenti in tempo reale dello stato dei workflow.
+	•	Row Level Security (RLS): Politiche di sicurezza per garantire che gli utenti accedano solo ai propri dati.
+	•	CORS: Configurazione ottimizzata per l'origine del frontend.
+
+API Endpoints principali:
+
+```
+POST   /api/user-service-credentials    # Invia credenziali di un servizio terzo (es. Shopify API Key) per salvarle in Vault
+GET    /api/user-service-credentials    # Lista i servizi per cui l'utente ha configurato credenziali (solo metadati)
+DELETE /api/user-service-credentials/:id # Revoca credenziali per un servizio (rimuove da Vault e DB metadati)
+POST   /api/prompts                     # Crea nuovo prompt iniziale, restituisce prompt_id e domande di chiarimento
+GET    /api/prompts/:id/clarifications  # (Rimosso o opzionale se le domande sono in POST /prompts)
+POST   /api/prompts/:id/clarifications  # Invia le risposte dell'utente alle domande di chiarimento
+POST   /api/workflows/from-prompt/:id   # Innesca la creazione del record workflow in Supabase (NON in n8n ancora)
+GET    /api/workflows?template=true     # Lista tutti i template di workflow
+POST   /api/workflows/from-template/:template_id # Clona un template per l'utente corrente (crea record in Supabase)
+GET    /api/workflows/popular-templates # Lista i template più popolari (basati su clone_count)
+GET    /api/workflows                   # Lista workflow utente (non template, `is_template=false`)
+GET    /api/workflows/:id               # Dettaglio workflow (include stato, credenziali richieste/configurate)
+POST   /api/workflows/:id/generate-n8n  # Innesca la creazione/aggiornamento del workflow in n8n (dopo config. credenziali)
+GET    /api/workflows/:id/runs          # Storico esecuzioni
+```
+
+SDK TypeScript disponibile per il frontend con tipi generati automaticamente dalle tabelle Supabase:
+
+```typescript
+// Esempio di utilizzo nel frontend
+import { createClient } from '@supabase/supabase-js'
+import type { Database } from './types/supabase'
+
+const supabase = createClient<Database>(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+)
+
+// 1. Crea nuovo prompt iniziale
+const createInitialPrompt = async (promptText: string) => {
+  const { data: promptData, error: promptError } = await supabase
+    .from('prompts')
+    .insert({ prompt_text: promptText })
+    .select()
+    .single()
+
+  if (promptError || !promptData) {
+    console.error('Errore creazione prompt:', promptError)
+    return null
+  }
+  return promptData.id
+}
+
+// 2. (Opzionale) Recupera domande di chiarimento se non restituite dal primo step
+// o se si vuole fare in un secondo momento
+const getClarificationQuestions = async (promptId: string) => {
+  // Potrebbe essere una chiamata a una Edge Function che le genera e le restituisce
+  const { data, error } = await supabase.rpc('generate_clarification_questions', { prompt_id_input: promptId })
+  // Oppure leggere direttamente dalla tabella se la Edge Function le ha già popolate
+  // const { data, error } = await supabase
+  //   .from('prompt_clarifications')
+  //   .select('id, question_text')
+  //   .eq('prompt_id', promptId)
+  
+  return { data, error }
+}
+
+// Gestione Credenziali Servizi Terzi
+interface ServiceCredentialPayload {
+  service_name: string; // es. "shopify", "airtable"
+  credentials: Record<string, any>; // es. { apiKey: "...", apiSecret: "..." }
+}
+const saveServiceCredential = async (payload: ServiceCredentialPayload) => {
+  // Questa chiamerà una Edge Function che si occuperà di salvare in Vault
+  const { data, error } = await supabase.rpc('manage_user_service_credential', payload )
+  return { data, error }
+}
+
+const listConfiguredServices = async () => {
+  const { data, error } = await supabase.from('user_service_credentials').select('id, service_name, last_updated_at')
+  return { data, error }
+}
+
+// 3. Invia risposte alle domande
+type Answer = { question_id: string; answer_text: string; answer_type: 'yes' | 'no' | 'custom' }
+const submitClarifications = async (answers: Answer[]) => {
+  const { data, error } = await supabase
+    .from('prompt_clarifications')
+    .upsert(answers.map(a => ({ id: a.question_id, user_answer: a.answer_text, answer_type: a.answer_type }))) // Assumendo che l'ID della domanda sia noto per l'update
+    .select()
+  return { data, error }
+}
+
+// 4. Innesca la creazione del record workflow in Supabase (dopo chiarimenti)
+const triggerWorkflowDefinitionCreation = async (promptId: string) => {
+  const { data, error } = await supabase.rpc('create_workflow_from_prompt', { prompt_id_input: promptId })
+  return { data, error } // Restituisce l'ID del nuovo record workflow in Supabase
+}
+
+// Lista TEMPLATE di workflow
+const listWorkflowTemplates = async () => {
+  const { data, error } = await supabase
+    .from('workflows')
+    .select('id, template_name, template_description, template_category')
+    .eq('is_template', true)
+    .order('template_category').order('template_name') // Ordinamento opzionale
+  return { data, error }
+}
+
+// Lista Template Popolari
+const listPopularWorkflowTemplates = async (limit: number = 5) => {
+  const { data, error } = await supabase
+    .from('workflows')
+    .select('id, template_name, template_description, template_category, clone_count')
+    .eq('is_template', true)
+    .order('clone_count', { ascending: false })
+    .limit(limit)
+  return { data, error }
+}
+
+// Clona un TEMPLATE per l'utente loggato
+const cloneWorkflowFromTemplate = async (templateId: string) => {
+    const { data, error } = await supabase.rpc('clone_workflow_from_template', { template_id_input: templateId })
+    return { data, error } // Restituisce il nuovo record workflow clonato in Supabase (per l'utente)
+}
+
+// Lista i MIEI workflow (non template)
+const listMyWorkflows = async () => {
+  // Assumendo che RLS sia configurata per restituire solo i workflow dell'utente autenticato
+  const { data, error } = await supabase
+    .from('workflows')
+    .select('*') // Seleziona tutti i campi necessari per la visualizzazione
+    .eq('is_template', false)
+    // .eq('user_id', userId) // RLS dovrebbe gestire questo
+  return { data, error }
+}
+
+// Funzione separata per generare/aggiornare il workflow in n8n dopo che l'utente ha configurato le credenziali
+const generateOrUpdateN8nWorkflow = async (workflowId: string) => {
+  const { data, error } = await supabase.rpc('generate_n8n_workflow', { workflow_id_input: workflowId })
+  return { data, error } // Potrebbe restituire lo stato o l'n8n_id aggiornato
+}
+
+```
+
+⸻
+
+8. Monitoraggio & allarmi
+
+Dashboard Grafana già pronte: error-rate, p95 latency, queue depth, workflow attivi e esecuzioni mensili per cliente.
+Alert Prometheus:
+
+Regola	Azione
+error_rate > 5 % / 15 min	Slack #ops (HIGH)
+latency p95 > 2 s	Slack (MEDIUM)
+queue_depth > 500	PagerDuty notte/festivi (piani Elite)
+near_limit_executions > 90%	Notifica cliente
+
+⸻
+
+9. Disaster Recovery
+	•	WAL-shipping Postgres → S3 (bucket in regione UE, es. `eu-central-1`) ogni 5 min + snapshot giornaliero cifrato AES-256 (anch'esso in regione UE).
+	•	Export JSON di tutti i workflow n8n ogni ora in bucket S3 immutabile (in regione UE, es. `eu-central-1`).
+	•	Script `dr_bootstrap.sh` ricrea cluster Supabase e ripristina DB + workflow in una regione secondaria all'interno dell'UE (es. `eu-west-1`, Irlanda) in caso di disastro nella regione primaria.
+	•	Obiettivi: RPO 15 min – RTO 60 min; test di DR due volte l'anno con checklist firmata dal CTO.
+
+⸻
+
+10. Build & deploy in 5 comandi
+
+Per l'ambiente di sviluppo locale:
+
+```bash
+git clone <repo> && cd <repo>
+cp supabase/.env.example supabase/.env   # inserisci chiavi locali Supabase e n8n (per dev)
+# Configurare le variabili d'ambiente per Vault e API keys GPT-4o se usate localmente
+docker compose up -d                     # supabase + n8n (dev) + vault + grafana + wiremock
+# Attendere che i servizi siano pronti
+# In una nuova finestra terminale:
+npx supabase db push                     # migrazioni al DB Supabase locale
+npm run test && npm run deploy:functions # esegue test e deploya Edge Functions su Supabase locale
+```
+
+**Esempio di `supabase/ai_capabilities.json`:**
+```json
+{
+  "enabled_automation_patterns": [
+    {
+      "id": "shopify_order_to_whatsapp_notion",
+      "description": "Invia notifica WhatsApp e crea record Notion per nuovi ordini Shopify.",
+      "required_services": ["shopify", "whatsapp", "notion"],
+      "keywords_trigger": ["shopify", "vendita", "ordine", "whatsapp", "notion", "salva"],
+      "status": "active"
+    },
+    {
+      "id": "airtable_report_to_whatsapp",
+      "description": "Invia report settimanale da Airtable a WhatsApp.",
+      "required_services": ["airtable", "whatsapp"],
+      "keywords_trigger": ["airtable", "report", "settimanale", "whatsapp", "lead"],
+      "status": "active"
+    }
+  ],
+  "global_settings": {
+    "allow_experimental_if_not_matched": false,
+    "default_behavior_if_unmatched": "inform_user_and_log"
+  }
+}
+```
+
+Per produzione, il deploy di n8n su GCP e la configurazione della connettività sicura sono gestiti separatamente tramite IaC (es. Terraform) e pipeline CI/CD dedicate per n8n.
+
+⸻
+
+11. Esempi pratici da includere
+
+Prompt utente per test integrazione
+«Quando ricevo una vendita Shopify invia WhatsApp e salva su Notion.»
+
+Dry-run atteso
+– input mock ordine #1001 → messaggio Slack simulato → record JSON salvato.
+
+⸻
+
+Output che mi aspetto dal team / dalla AI
+	1.	Repository ZIP con tutta la struttura sopra.
+	2.	README chiaro e prova di avvio locale.
+	3.	Script CI pronto, schema SQL applicabile, Edge Functions pronte.
+	4.	Morbido "hello world" funzionante: inserisco un prompt, vedo il workflow n8n creato, lo test runna in mock, si attiva.
+
+⸻
+
+Con questo documento hai tutto ciò di cui hai bisogno per generare in un colpo solo un backend funzionante, testabile, versionato e pronto per essere scalato a clienti enterprise.

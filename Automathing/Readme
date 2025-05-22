@@ -1,0 +1,56 @@
+### Integrazione Modelli AI Avanzati
+
+Per l'elaborazione del linguaggio naturale e la comprensione delle richieste utente, il sistema integra modelli AI avanzati. Attualmente, è configurato per utilizzare **Google Gemini 2.5 Pro** attraverso **OpenRouter**.
+
+#### Configurazione OpenRouter Client
+
+Per abilitare l'interazione con i modelli Gemini tramite OpenRouter, è necessario configurare la seguente variabile d'ambiente:
+
+*   `OPENROUTER_API_KEY`: La tua chiave API personale per OpenRouter.
+
+Puoi ottenere una API key registrandoti sul sito di OpenRouter.
+
+Il client Python per interagire con OpenRouter si trova in `Automathing/lib/openrouter_ai_client.py`. Questo client utilizza la libreria `openai` per effettuare le chiamate API, permettendo una facile integrazione e l'utilizzo di modelli specifici come `google/gemini-2.5-flash-preview-05-20:thinking` per task generici o `google/gemini-pro-vision` per analisi di immagini.
+
+**Esempio di utilizzo del client (da `openrouter_ai_client.py`):**
+
+```python
+from Automathing.lib.openrouter_ai_client import get_gemini_completion_with_openrouter
+
+# Per input testuali
+text_messages = [
+    {
+        "role": "user",
+        "content": "Qual è la capitale della Francia?"
+    }
+]
+response = get_gemini_completion_with_openrouter(text_messages)
+if response:
+    print(f"Risposta del modello: {response}")
+
+# Per input con immagini (assicurati di usare un modello vision, es. google/gemini-pro-vision)
+image_messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "Cosa c'è in questa immagine?"
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "URL_DELL_IMMAGINE_QUI" # Sostituisci con un URL valido
+                }
+            }
+        ]
+    }
+]
+response_image = get_gemini_completion_with_openrouter(image_messages, model="google/gemini-pro-vision")
+if response_image:
+    print(f"Risposta del modello sull'immagine: {response_image}")
+
+```
+Assicurati che la variabile d'ambiente `OPENROUTER_API_KEY` sia impostata correttamente nel tuo ambiente di esecuzione. Puoi anche passare opzionalmente `site_url` e `site_name` alla funzione `get_gemini_completion_with_openrouter` se desideri che il tuo sito appaia nelle classifiche di OpenRouter.
+
+### Gestione Credenziali API Utente (Workflow Specifici) 
